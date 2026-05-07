@@ -1,0 +1,107 @@
+# ============================================
+# DETECT SHARED ACCOUNTS (WITH IP DETAILS)
+# ============================================
+
+Import-Module Microsoft.Graph.Authentication -ErrorAction SilentlyContinue
+Import-Module Microsoft.Graph.Reports -ErrorAction SilentlyContinue
+
+Connect-MgGraph -Scopes "AuditLog.Read.All"
+
+Write-Host "Checking all users for shared account usage..." -ForegroundColor Cyan
+Write-Host ""
+
+# ✅ Last 40 days
+$startDate = (Get-Date).AddDays(-40).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+# Thresholds
+$ipThreshold = 3
+$loginThreshold = 15
+
+# -------------------------------
+# GET SIGN-IN LOGS
+# -------------------------------
+try {
+    $signIns = Get-MgAuditLogSignIn -Filter "createdDateTime ge $startDate" -All
+}
+catch {
+    Write-Host "❌ Failed to retrieve logs" -ForegroundColor Red
+    return
+}
+
+if (-not $signIns) {
+    Write-Host "❌ No sign-in logs found" -ForegroundColor Red
+    return
+}
+
+# -------------------------------
+# GROUP & ANALYZE
+# -------------------------------
+$userGroups = $signIns | Group-Object UserPrincipalName
+
+$results = foreach ($user in $userGroups) {
+
+    $logs = $user.Group
+
+    $totalLogins = $logs.Count
+    $uniqueIPsList = ($logs | Select-Object -ExpandProperty IPAddress -Unique)
+    $uniqueIPsCount = $uniqueIPsList.Count
+    $uniqueApps  = ($logs | Select-Object -ExpandProperty AppDisplayName -Unique)
+
+    # Convert IP list to string
+    $ipString = $uniqueIPsList -join ", "
+
+    if ($uniqueIPsCount -ge $ipThreshold -or $totalLogins -ge $loginThreshold) {
+
+        [PSCustomObject]@{
+            User        = $user.Name
+            TotalLogins = $totalLogins
+            UniqueIPs   = $uniqueIPsCount
+            IPList      = $ipString
+            AppsUsed    = ($uniqueApps -join ", ")
+            Risk        = if ($uniqueIPsCount -gt 5 -or $totalLogins -gt 30) { "HIGH" } else { "MEDIUM" }
+        }
+    }
+}
+
+# -------------------------------
+# EXPORT
+# -------------------------------
+$outputFile = "$env:USERPROFILE\Downloads\Shared_Account_Report_With_IPs.csv"
+
+$results | ConvertTo-Csv -NoTypeInformation | Out-File -Encoding utf8 -FilePath $outputFile
+
+# -------------------------------
+# FINAL OUTPUT
+# -------------------------------
+Write-Host "================ FINAL REPORT ================" -ForegroundColor Cyan
+Write-Host ""
+
+if (-not $results) {
+
+    Write-Host "✅ No shared/suspicious accounts detected" -ForegroundColor Green
+
+} else {
+
+    Write-Host "⚠️ Suspicious shared accounts detected" -ForegroundColor Red
+    Write-Host ""
+
+    Write-Host "TOTAL SUSPECTED ACCOUNTS : $($results.Count)" -ForegroundColor Yellow
+    Write-Host ""
+
+    # ✅ Display in console
+    $results | Sort-Object Risk -Descending | Format-Table -AutoSize
+
+    Write-Host ""
+    Write-Host "TOP USERS (WITH IPs):" -ForegroundColor Cyan
+
+    $results | Sort-Object TotalLogins -Descending | Select-Object -First 10 |
+    ForEach-Object {
+        Write-Host "$($_.User) - $($_.TotalLogins) logins - IPs: $($_.IPList)"
+    }
+}
+
+Write-Host ""
+Write-Host "REPORT SAVED:" -ForegroundColor Green
+Write-Host $outputFile -ForegroundColor Yellow
+Write-Host ""
+Write-Host "==============================================" -ForegroundColor Cyan
