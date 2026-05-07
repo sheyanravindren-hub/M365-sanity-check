@@ -1,0 +1,93 @@
+# ============================================
+# FIND ACCOUNT USED BY MULTIPLE PEOPLE
+# ============================================
+
+# -------- CONNECT TO MICROSOFT GRAPH --------
+Import-Module Microsoft.Graph.Authentication -ErrorAction SilentlyContinue
+Import-Module Microsoft.Graph.Reports -ErrorAction SilentlyContinue
+
+Connect-MgGraph -Scopes "AuditLog.Read.All"
+
+Write-Host "Analyzing sign-in activity..." -ForegroundColor Cyan
+Write-Host ""
+
+# -------- SETTINGS --------
+$startDate = (Get-Date).AddDays(-30).ToString("o")   # last 30 days
+
+$ipThreshold     = 3   # more than 3 IPs = suspicious
+$loginThreshold  = 10  # many logins = suspicious
+
+# -------- GET SIGN-IN LOGS --------
+try {
+    $signIns = Get-MgAuditLogSignIn -Filter "createdDateTime ge $startDate" -All
+}
+catch {
+    Write-Host "❌ Cannot retrieve sign-in logs (Graph module or permission issue)" -ForegroundColor Red
+    return
+}
+
+if (-not $signIns) {
+    Write-Host "❌ No sign-in logs found in tenant" -ForegroundColor Red
+    return
+}
+
+Write-Host "Total sign-in records:" $signIns.Count -ForegroundColor Yellow
+Write-Host ""
+
+# -------- GROUP BY USER --------
+$userGroups = $signIns | Group-Object UserPrincipalName
+
+$analysis = foreach ($user in $userGroups) {
+
+    $logs = $user.Group
+
+    $totalLogins = $logs.Count
+    $uniqueIPs   = ($logs | Select-Object -ExpandProperty IPAddress -Unique).Count
+    $uniqueApps  = ($logs | Select-Object -ExpandProperty AppDisplayName -Unique).Count
+
+    # Detect suspicious usage
+    if ($uniqueIPs -ge $ipThreshold -or $totalLogins -ge $loginThreshold) {
+
+        [PSCustomObject]@{
+            User        = $user.Name
+            Logins      = $totalLogins
+            UniqueIPs   = $uniqueIPs
+            AppsUsed    = $uniqueApps
+        }
+    }
+}
+
+# -------- NO RESULTS --------
+if (-not $analysis) {
+    Write-Host "✅ No accounts appear to be shared or used by multiple people" -ForegroundColor Green
+    return
+}
+
+# -------- FIND MOST SUSPICIOUS ACCOUNT --------
+$topAccount = $analysis | Sort-Object UniqueIPs,Logins -Descending | Select-Object -First 1
+
+# -------- EXPORT --------
+$outputFile = "$env:USERPROFILE\Downloads\Shared_Account_Detection.csv"
+$analysis | ConvertTo-Csv -NoTypeInformation | Out-File -Encoding utf8 -FilePath $outputFile
+
+# -------- FINAL OUTPUT --------
+Write-Host "================ FINAL RESULT ================" -ForegroundColor Cyan
+Write-Host ""
+
+Write-Host "⚠️ MOST LIKELY SHARED ACCOUNT:" -ForegroundColor Red
+Write-Host ""
+
+Write-Host "User        : $($topAccount.User)"
+Write-Host "Total Logins: $($topAccount.Logins)"
+Write-Host "Unique IPs  : $($topAccount.UniqueIPs)"
+Write-Host "Apps Used   : $($topAccount.AppsUsed)"
+
+Write-Host ""
+Write-Host "Other suspicious accounts:" -ForegroundColor Cyan
+$analysis | Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "REPORT SAVED:" -ForegroundColor Green
+Write-Host $outputFile -ForegroundColor Yellow
+Write-Host ""
+Write-Host "==============================================" -ForegroundColor Cyan
