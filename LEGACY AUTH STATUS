@@ -1,0 +1,51 @@
+Write-Host ""
+Write-Host "================ FINAL REPORT ================" -ForegroundColor Cyan
+Write-Host ""
+
+# Status
+if ($legacyEnabled) {
+    Write-Host "LEGACY AUTH STATUS : ENABLED ❌" -ForegroundColor Red
+} else {
+    Write-Host "LEGACY AUTH STATUS : DISABLED ✅" -ForegroundColor Green
+}
+
+Write-Host ""
+
+if (-not $results) {
+
+    Write-Host "TOTAL LEGACY LOGINS : 0" -ForegroundColor Green
+    Write-Host "SUCCESS             : 0"
+    Write-Host "FAILED              : 0"
+
+} else {
+
+    $total   = $results.Count
+    $success = ($results | Where-Object {$_.Status -eq "SUCCESS"}).Count
+    $failed  = ($results | Where-Object {$_.Status -eq "FAILED"}).Count
+
+    Write-Host "TOTAL LEGACY LOGINS : $total" -ForegroundColor Yellow
+    Write-Host "SUCCESS             : $success"
+    Write-Host "FAILED              : $failed
+"
+    Write-Host "TOP USERS:" -ForegroundColor Cyan
+
+    $results | Group-Object User | Sort-Object Count -Descending | Select-Object -First 10 |
+    ForEach-Object {
+        Write-Host "$($_.Name) - $($_.Count) attempts"
+    }
+
+    Write-Host ""
+    Write-Host "TOP CLIENT APPS:" -ForegroundColor Cyan
+
+    $results | Group-Object ClientApp | Sort-Object Count -Descending | Select-Object -First 10 |
+    ForEach-Object {
+        Write-Host "$($_.Name) - $($_.Count)"
+    }
+}
+
+Write-Host ""
+Write-Host "REPORT SAVED:" -ForegroundColor Green
+Write-Host $outputFile -ForegroundColor Yellow
+
+Write-Host ""
+Write-Host "==============================================" -ForegroundColor Cyan
