@@ -1,0 +1,143 @@
+# ============================================
+# USER BEHAVIOR BASELINE ANOMALY DETECTION
+# FULL SOC VERSION (ERROR FREE)
+# ============================================
+
+Import-Module Microsoft.Graph.Authentication
+Connect-MgGraph -Scopes "AuditLog.Read.All"
+
+# ============================================
+# SETTINGS
+# ============================================
+
+$days = 60
+$startDate = (Get-Date).AddDays(-$days).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+Write-Host ""
+Write-Host "====================================" -ForegroundColor Cyan
+Write-Host " UEBA - BEHAVIOR ANOMALY DETECTION"
+Write-Host "====================================" -ForegroundColor Cyan
+Write-Host ""
+
+# ============================================
+# GET SIGN-IN LOGS
+# ============================================
+
+$signIns = Get-MgAuditLogSignIn `
+    -Filter "createdDateTime ge $startDate" `
+    -All `
+    -Property UserPrincipalName,IPAddress,CreatedDateTime,Location,DeviceDetail,ClientAppUsed
+
+if (-not $signIns -or $signIns.Count -eq 0) {
+    Write-Host "⚠️ No sign-in logs found" -ForegroundColor Yellow
+    return
+}
+
+# ============================================
+# GROUP BY USER
+# ============================================
+
+$users = $signIns | Group-Object UserPrincipalName
+
+# ============================================
+# ANALYSIS ENGINE
+# ============================================
+
+$results = foreach ($user in $users) {
+
+    $logs = $user.Group
+
+    # =========================
+    # BASELINE (NORMAL BEHAVIOR)
+    # =========================
+
+    $baseIPs       = $logs.IPAddress | Where-Object { $_ } | Select-Object -Unique
+    $baseCountries = $logs.Location.CountryOrRegion | Where-Object { $_ } | Select-Object -Unique
+    $baseDevices   = $logs.DeviceDetail.OperatingSystem | Where-Object { $_ } | Select-Object -Unique
+    $baseBrowsers  = $logs.DeviceDetail.Browser | Where-Object { $_ } | Select-Object -Unique
+
+    # =========================
+    # RECENT BEHAVIOR (LAST 3 DAYS)
+    # =========================
+
+    $recent = $logs | Where-Object {
+        $_.CreatedDateTime -gt (Get-Date).AddDays(-3)
+    }
+
+    $recentIPs       = $recent.IPAddress | Where-Object { $_ } | Select-Object -Unique
+    $recentCountries = $recent.Location.CountryOrRegion | Where-Object { $_ } | Select-Object -Unique
+    $recentDevices   = $recent.DeviceDetail.OperatingSystem | Where-Object { $_ } | Select-Object -Unique
+    $recentBrowsers  = $recent.DeviceDetail.Browser | Where-Object { $_ } | Select-Object -Unique
+
+    # =========================
+    # ANOMALY DETECTION
+    # =========================
+
+    $newIP       = ($recentIPs | Where-Object { $_ -notin $baseIPs }).Count
+    $newCountry  = ($recentCountries | Where-Object { $_ -notin $baseCountries }).Count
+    $newDevice   = ($recentDevices | Where-Object { $_ -notin $baseDevices }).Count
+    $newBrowser  = ($recentBrowsers | Where-Object { $_ -notin $baseBrowsers }).Count
+
+    $riskScore = 0
+
+    if ($newIP -gt 0)      { $riskScore += 30 }
+    if ($newCountry -gt 0) { $riskScore += 40 }
+    if ($newDevice -gt 0)  { $riskScore += 20 }
+    if ($newBrowser -gt 0) { $riskScore += 10 }
+
+    # =========================
+    # OUTPUT FORMAT (YOUR REQUEST)
+    # =========================
+
+    foreach ($log in $recent) {
+
+        [PSCustomObject]@{
+
+            User     = $log.UserPrincipalName
+            Date     = $log.CreatedDateTime
+            IP       = $log.IPAddress
+
+            Device   = $log.DeviceDetail.OperatingSystem
+
+            Location = "$($log.Location.CountryOrRegion) - $($log.Location.City)"
+
+            RiskScore = $riskScore
+
+            RiskLevel = if ($riskScore -ge 70) { "HIGH" }
+                        elseif ($riskScore -ge 40) { "MEDIUM" }
+                        else { "LOW" }
+        }
+    }
+}
+
+# ============================================
+# SORT OUTPUT
+# ============================================
+
+$results = $results | Sort-Object Date -Descending
+
+# ============================================
+# CONSOLE OUTPUT (CLEAN TABLE)
+# ============================================
+
+Write-Host ""
+Write-Host "========== UEBA RESULTS ==========" -ForegroundColor Cyan
+Write-Host ""
+
+$results | Format-Table User, Date, IP, Device, Location, RiskLevel -AutoSize
+
+Write-Host ""
+Write-Host "Total Records: $($results.Count)" -ForegroundColor Yellow
+Write-Host ""
+
+# ============================================
+# EXPORT CSV
+# ============================================
+
+$outputFile = "$env:USERPROFILE\Downloads\UEBA_Baseline_Anomaly_Report.csv"
+
+$results | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+
+Write-Host "📁 Report saved to:" -ForegroundColor Green
+Write-Host $outputFile -ForegroundColor Yellow
+Write-Host ""
