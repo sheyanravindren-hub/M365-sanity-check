@@ -1,0 +1,104 @@
+# ============================================
+# CONNECT TO MICROSOFT GRAPH
+# ============================================
+Import-Module Microsoft.Graph.Authentication
+Connect-MgGraph -Scopes "AuditLog.Read.All"
+
+# ============================================
+# SETTINGS
+# ============================================
+$startDate = (Get-Date).AddDays(-7).ToString("o")
+
+# Thresholds (you can tune)
+$failedThreshold = 5
+$totalThreshold  = 10
+
+# Legacy protocols
+$legacyProtocols = @(
+    "IMAP",
+    "POP3",
+    "Authenticated SMTP",
+    "Exchange ActiveSync",
+    "Other",
+    "Other clients"
+)
+
+Write-Host "Checking for suspicious users..." -ForegroundColor Cyan
+Write-Host ""
+
+# ============================================
+# GET SIGN-IN LOGS
+# ============================================
+$signIns = Get-MgAuditLogSignIn -Filter "createdDateTime ge $startDate" -All
+
+# ============================================
+# PROCESS USERS
+# ============================================
+$groupedUsers = $signIns | Group-Object UserPrincipalName
+
+$riskyUsers = foreach ($user in $groupedUsers) {
+
+    $userLogs = $user.Group
+
+    $totalAttempts = $userLogs.Count
+    $failedAttempts = ($userLogs | Where-Object {$_.Status.ErrorCode -ne 0}).Count
+
+    $legacyUsage = ($userLogs | Where-Object {
+        $_.ClientAppUsed -in $legacyProtocols
+    }).Count
+
+    $uniqueIPs = ($userLogs | Select-Object -ExpandProperty IPAddress -Unique).Count
+
+    # ✅ Risk Logic
+    if (
+        $failedAttempts -ge $failedThreshold -or
+        $totalAttempts -ge $totalThreshold -or
+        $legacyUsage -gt 0 -or
+        $uniqueIPs -gt 3
+    ) {
+
+        [PSCustomObject]@{
+            User              = $user.Name
+            TotalAttempts     = $totalAttempts
+            FailedAttempts    = $failedAttempts
+            LegacyAuthUsed    = if ($legacyUsage -gt 0) { "YES" } else { "NO" }
+            UniqueIPs         = $uniqueIPs
+            RiskLevel         = if ($failedAttempts -ge 10 -or $legacyUsage -gt 0) { "HIGH" } else { "MEDIUM" }
+        }
+    }
+}
+
+# ============================================
+# EXPORT
+# ============================================
+$outputFile = "$env:USERPROFILE\Downloads\RiskyUsers_Report.csv"
+$riskyUsers | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+
+# ============================================
+# DISPLAY RESULT
+# ============================================
+Write-Host ""
+Write-Host "===== RISKY USERS REPORT =====" -ForegroundColor Cyan
+
+if (-not $riskyUsers) {
+
+    Write-Host "✅ No suspicious users found" -ForegroundColor Green
+
+} else {
+
+    $riskyUsers | Sort-Object RiskLevel -Descending | Format-Table -AutoSize
+
+    Write-Host ""
+    Write-Host "TOTAL RISKY USERS:" $riskyUsers.Count -ForegroundColor Yellow
+
+    Write-Host ""
+    Write-Host "⚠️ Risk Criteria Used:" -ForegroundColor Cyan
+    Write-Host "- Failed logins >= $failedThreshold"
+    Write-Host "- Total attempts >= $totalThreshold"
+    Write-Host "- Legacy authentication detected"
+    Write-Host "- More than 3 IP addresses"
+}
+
+Write-Host ""
+Write-Host "✅ Report saved to:" -ForegroundColor Green
+Write-Host $outputFile -ForegroundColor Yellow
