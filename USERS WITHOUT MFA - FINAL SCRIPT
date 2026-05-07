@@ -1,0 +1,81 @@
+# ============================================
+# USERS WITHOUT MFA - FINAL SCRIPT
+# ============================================
+
+Import-Module Microsoft.Graph.Users -ErrorAction SilentlyContinue
+Import-Module Microsoft.Graph.Identity.SignIns -ErrorAction SilentlyContinue
+
+Connect-MgGraph -Scopes "User.Read.All","Directory.Read.All","AuthenticationMethod.Read.All"
+
+Write-Host "Checking users without MFA..." -ForegroundColor Cyan
+
+# -------------------------------
+# GET USERS
+# -------------------------------
+$users = Get-MgUser -All -Property Id,DisplayName,UserPrincipalName
+
+# -------------------------------
+# BUILD RESULTS
+# -------------------------------
+$data = foreach ($user in $users) {
+
+    try {
+        $methods = Get-MgUserAuthenticationMethod -UserId $user.Id
+    } catch {
+        continue
+    }
+
+    if ($methods.Count -le 1) {
+        [PSCustomObject]@{
+            UserDisplayName   = $user.DisplayName
+            UserPrincipalName = $user.UserPrincipalName
+            MFAStatus         = "Disabled"
+        }
+    }
+}
+
+# -------------------------------
+# EXPORT TO EXCEL (CSV)
+# -------------------------------
+$outputFile = "$env:USERPROFILE\Downloads\Users_Without_MFA.csv"
+
+$data | ConvertTo-Csv -NoTypeInformation | Out-File -Encoding utf8 -FilePath $outputFile
+
+# -------------------------------
+# FINAL OUTPUT
+# -------------------------------
+Write-Host ""
+Write-Host "================ FINAL REPORT ================" -ForegroundColor Cyan
+Write-Host ""
+
+if (-not $data -or $data.Count -eq 0) {
+
+    Write-Host "✅ No users found without MFA" -ForegroundColor Green
+
+} else {
+
+    Write-Host "❌ USERS WITHOUT MFA FOUND" -ForegroundColor Red
+    Write-Host ""
+
+    # ✅ Count
+    Write-Host "TOTAL USERS WITHOUT MFA : $($data.Count)" -ForegroundColor Yellow
+    Write-Host ""
+
+    # ✅ FULL TABLE OUTPUT (IMPORTANT ✅)
+    Write-Host "USER DETAILS:" -ForegroundColor Cyan
+    $data | Sort-Object UserPrincipalName | Format-Table -AutoSize
+
+    Write-Host ""
+
+    # ✅ TOP USERS
+    Write-Host "TOP USERS:" -ForegroundColor Cyan
+    $data | Select-Object -First 10 | ForEach-Object {
+        Write-Host $_.UserPrincipalName
+    }
+}
+
+Write-Host ""
+Write-Host "REPORT SAVED:" -ForegroundColor Green
+Write-Host $outputFile -ForegroundColor Yellow
+Write-Host ""
+Write-Host "==============================================" -ForegroundColor Cyan
