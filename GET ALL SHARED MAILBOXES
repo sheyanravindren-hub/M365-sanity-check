@@ -1,0 +1,83 @@
+# ============================================
+# CONNECT TO EXCHANGE ONLINE
+# ============================================
+Import-Module ExchangeOnlineManagement
+Connect-ExchangeOnline
+
+# ============================================
+# OUTPUT FILE
+# ============================================
+$outputFile = "$env:USERPROFILE\Downloads\SharedMailbox_Permissions_Report.csv"
+
+$results = @()
+
+# ============================================
+# GET ALL SHARED MAILBOXES
+# ============================================
+$mailboxes = Get-Mailbox -RecipientTypeDetails SharedMailbox -ResultSize Unlimited
+
+foreach ($mb in $mailboxes) {
+
+    $mailboxName = $mb.DisplayName
+    $mailboxUPN  = $mb.PrimarySmtpAddress
+
+    # ----------------------------------------
+    # FULL ACCESS PERMISSIONS
+    # ----------------------------------------
+    $fullAccessUsers = Get-MailboxPermission -Identity $mb.Identity |
+        Where-Object {
+            $_.AccessRights -like "*FullAccess*" -and $_.User -notlike "NT AUTHORITY\SELF"
+        }
+
+    foreach ($user in $fullAccessUsers) {
+        $results += [PSCustomObject]@{
+            Mailbox        = $mailboxName
+            Email          = $mailboxUPN
+            PermissionType = "Full Access"
+            User           = $user.User
+        }
+    }
+
+    # ----------------------------------------
+    # SEND AS PERMISSIONS
+    # ----------------------------------------
+    $sendAsUsers = Get-RecipientPermission -Identity $mb.Identity |
+        Where-Object {
+            $_.AccessRights -contains "SendAs"
+        }
+
+    foreach ($user in $sendAsUsers) {
+        $results += [PSCustomObject]@{
+            Mailbox        = $mailboxName
+            Email          = $mailboxUPN
+            PermissionType = "Send As"
+            User           = $user.Trustee
+        }
+    }
+
+    # ----------------------------------------
+    # SEND ON BEHALF PERMISSIONS
+    # ----------------------------------------
+    $sendOnBehalfUsers = $mb.GrantSendOnBehalfTo
+
+    if ($sendOnBehalfUsers) {
+        foreach ($user in $sendOnBehalfUsers) {
+            $results += [PSCustomObject]@{
+                Mailbox        = $mailboxName
+                Email          = $mailboxUPN
+                PermissionType = "Send On Behalf"
+                User           = $user
+            }
+        }
+    }
+}
+
+# ============================================
+# EXPORT TO CSV (EXCEL)
+# ============================================
+$results | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "✅ Report Generated Successfully!" -ForegroundColor Green
+Write-Host "📄 File Location:" -ForegroundColor Cyan
+Write-Host $outputFile -ForegroundColor Yellow
