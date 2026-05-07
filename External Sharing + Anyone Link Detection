@@ -1,0 +1,148 @@
+# ============================================
+# SHAREPOINT + ONEDRIVE SECURITY REPORT
+# External Sharing + Anyone Link Detection
+# CLEAN + ERROR SAFE + CONSOLE + EXCEL
+# ============================================
+
+Import-Module ExchangeOnlineManagement
+Import-Module ImportExcel
+
+Connect-ExchangeOnline
+
+# ============================
+# SETTINGS
+# ============================
+$startDate = (Get-Date).AddDays(-30)
+$endDate   = Get-Date
+
+Write-Host "`n====================================" -ForegroundColor Cyan
+Write-Host " SHAREPOINT / ONEDRIVE SECURITY REPORT" -ForegroundColor Cyan
+Write-Host "====================================`n" -ForegroundColor Cyan
+
+# ============================
+# GET AUDIT LOGS
+# ============================
+$logs = Search-UnifiedAuditLog `
+    -StartDate $startDate `
+    -EndDate $endDate `
+    -Operations SharingSet,SharingInvitationCreated,SecureLinkCreated,AddedToSecureLink,AnonymousLinkCreated,CompanyLinkCreated `
+    -ResultSize 5000 -ErrorAction SilentlyContinue
+
+if (-not $logs) {
+    Write-Host "❌ NO AUDIT DATA FOUND (Check: Audit Logging Enabled)" -ForegroundColor Red
+    return
+}
+
+# ============================
+# PARSE LOGS SAFELY
+# ============================
+$results = foreach ($log in $logs) {
+
+    $data = $null
+
+    if ($log.AuditData) {
+        try {
+            $data = $log.AuditData | ConvertFrom-Json -ErrorAction Stop
+        }
+        catch {
+            $data = $null
+        }
+    }
+
+    $external = $false
+    if ($data -and $data.TargetUserOrGroupType -match "Guest|External") {
+        $external = $true
+    }
+
+    $anyoneLink = $false
+    if ($log.Operations -match "AnonymousLinkCreated|CompanyLinkCreated") {
+        $anyoneLink = $true
+    }
+
+    [PSCustomObject]@{
+        User         = $log.UserIds
+        Time         = $log.CreationDate
+        IPAddress    = $log.ClientIP
+        Action       = $log.Operations
+        FileOrFolder = if ($data) { $data.ObjectId } else { "N/A" }
+        Site         = if ($data) { $data.SiteUrl } else { "N/A" }
+        External     = $external
+        AnyoneLink   = $anyoneLink
+    }
+}
+
+# ============================
+# FILTER DATA
+# ============================
+$externalShares = $results | Where-Object { $_.External -eq $true }
+$anyoneLinks    = $results | Where-Object { $_.AnyoneLink -eq $true }
+
+# ============================
+# CONSOLE OUTPUT
+# ============================
+
+Write-Host "========== ALL SHARING EVENTS ==========`n" -ForegroundColor Cyan
+$results | Sort-Object Time -Descending | Format-Table -AutoSize
+
+Write-Host "`nTOTAL EVENTS: $($results.Count)" -ForegroundColor Yellow
+
+# ---- External Sharing ----
+Write-Host "`n========== EXTERNAL SHARING ==========`n" -ForegroundColor Cyan
+
+if ($externalShares.Count -gt 0) {
+    $externalShares | Sort-Object Time -Descending |
+        Format-Table User, Action, FileOrFolder, Time, IPAddress -AutoSize
+} else {
+    Write-Host "No external sharing detected" -ForegroundColor Green
+}
+
+Write-Host "TOTAL EXTERNAL SHARES: $($externalShares.Count)" -ForegroundColor Yellow
+
+# ---- Anyone Links ----
+Write-Host "`n========== ANYONE WITH LINK ==========`n" -ForegroundColor Cyan
+
+if ($anyoneLinks.Count -gt 0) {
+    $anyoneLinks | Sort-Object Time -Descending |
+        Format-Table User, Action, FileOrFolder, Time, IPAddress -AutoSize
+} else {
+    Write-Host "No anyone-with-link sharing detected" -ForegroundColor Green
+}
+
+Write-Host "TOTAL ANYONE LINKS: $($anyoneLinks.Count)" -ForegroundColor Yellow
+
+# ---- Top Users ----
+Write-Host "`n========== TOP SHARING USERS ==========`n" -ForegroundColor Cyan
+
+$results |
+Group-Object User |
+Sort-Object Count -Descending |
+Select-Object Name, Count |
+Format-Table -AutoSize
+
+# ============================
+# EXCEL EXPORT (FIXED)
+# ============================
+$outputFile = "$env:USERPROFILE\Downloads\SP_OD_Security_Report.xlsx"
+
+if (Test-Path $outputFile) {
+    try {
+        Remove-Item $outputFile -Force -ErrorAction Stop
+    }
+    catch {
+        Write-Host "⚠ Close Excel file first then rerun" -ForegroundColor Yellow
+    }
+}
+
+# Sheet 1 - All
+$results | Export-Excel -Path $outputFile -WorksheetName "AllSharing" -AutoSize -BoldTopRow
+
+# Sheet 2 - External
+$externalShares | Export-Excel -Path $outputFile -WorksheetName "ExternalSharing" -AutoSize -Append
+
+# Sheet 3 - Anyone Links
+$anyoneLinks | Export-Excel -Path $outputFile -WorksheetName "AnyoneLinks" -AutoSize -Append
+
+Write-Host "`n====================================" -ForegroundColor Cyan
+Write-Host "✅ REPORT GENERATED SUCCESSFULLY" -ForegroundColor Green
+Write-Host "FILE: $outputFile" -ForegroundColor Yellow
+Write-Host "====================================`n" -ForegroundColor Cyan
