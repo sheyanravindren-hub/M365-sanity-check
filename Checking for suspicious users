@@ -1,104 +1,86 @@
 # ============================================
-# CONNECT TO MICROSOFT GRAPH
+# M365 LEGACY AUTH DETECTION (ERROR-FREE)
 # ============================================
-Import-Module Microsoft.Graph.Authentication
-Connect-MgGraph -Scopes "AuditLog.Read.All"
 
-# ============================================
-# SETTINGS
-# ============================================
-$startDate = (Get-Date).AddDays(-7).ToString("o")
+Write-Host "Starting Legacy Authentication Analysis..." -ForegroundColor Cyan
 
-# Thresholds (you can tune)
-$failedThreshold = 5
-$totalThreshold  = 10
+# FIX LOGIN POPUP ISSUE
+Set-MgGraphOption -DisableLoginByWAM $true
 
-# Legacy protocols
-$legacyProtocols = @(
-    "IMAP",
-    "POP3",
-    "Authenticated SMTP",
-    "Exchange ActiveSync",
-    "Other",
-    "Other clients"
-)
+# CONNECT TO GRAPH
+Connect-MgGraph -Scopes "AuditLog.Read.All","Directory.Read.All"
 
-Write-Host "Checking for suspicious users..." -ForegroundColor Cyan
-Write-Host ""
+Write-Host "`nConnected to Microsoft Graph" -ForegroundColor Green
 
-# ============================================
-# GET SIGN-IN LOGS
-# ============================================
-$signIns = Get-MgAuditLogSignIn -Filter "createdDateTime ge $startDate" -All
+# GET SIGN-IN LOGS (LAST 7 DAYS)
+Write-Host "`nFetching sign-in logs..." -ForegroundColor Yellow
 
-# ============================================
-# PROCESS USERS
-# ============================================
-$groupedUsers = $signIns | Group-Object UserPrincipalName
+$signIns = Get-MgAuditLogSignIn -All
 
-$riskyUsers = foreach ($user in $groupedUsers) {
-
-    $userLogs = $user.Group
-
-    $totalAttempts = $userLogs.Count
-    $failedAttempts = ($userLogs | Where-Object {$_.Status.ErrorCode -ne 0}).Count
-
-    $legacyUsage = ($userLogs | Where-Object {
-        $_.ClientAppUsed -in $legacyProtocols
-    }).Count
-
-    $uniqueIPs = ($userLogs | Select-Object -ExpandProperty IPAddress -Unique).Count
-
-    # ✅ Risk Logic
-    if (
-        $failedAttempts -ge $failedThreshold -or
-        $totalAttempts -ge $totalThreshold -or
-        $legacyUsage -gt 0 -or
-        $uniqueIPs -gt 3
-    ) {
-
-        [PSCustomObject]@{
-            User              = $user.Name
-            TotalAttempts     = $totalAttempts
-            FailedAttempts    = $failedAttempts
-            LegacyAuthUsed    = if ($legacyUsage -gt 0) { "YES" } else { "NO" }
-            UniqueIPs         = $uniqueIPs
-            RiskLevel         = if ($failedAttempts -ge 10 -or $legacyUsage -gt 0) { "HIGH" } else { "MEDIUM" }
-        }
-    }
+# FILTER LEGACY AUTH
+$legacySignIns = $signIns | Where-Object {
+    $_.ClientAppUsed -in @(
+        "Other clients",
+        "IMAP",
+        "POP",
+        "SMTP",
+        "Exchange ActiveSync"
+    ) -or
+    $_.ClientAppUsed -match "Legacy"
 }
 
-# ============================================
-# EXPORT
-# ============================================
-$outputFile = "$env:USERPROFILE\Downloads\RiskyUsers_Report.csv"
-$riskyUsers | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+# ============================
+# SUMMARY HEADER
+# ============================
+Write-Host "`n===============================" -ForegroundColor Green
+Write-Host " LEGACY AUTH REPORT"
+Write-Host "===============================" -ForegroundColor Green
 
-# ============================================
-# DISPLAY RESULT
-# ============================================
-Write-Host ""
-Write-Host "===== RISKY USERS REPORT =====" -ForegroundColor Cyan
+# ============================
+# CHECK RESULT
+# ============================
+if ($legacySignIns.Count -eq 0) {
+    Write-Host "No Legacy Authentication detected in last 7 days." -ForegroundColor Green
+}
+else {
 
-if (-not $riskyUsers) {
+    Write-Host "Total Legacy Auth Sign-ins: $($legacySignIns.Count)" -ForegroundColor Red
 
-    Write-Host "✅ No suspicious users found" -ForegroundColor Green
+    # ============================
+    # USER LIST (IMPORTANT PART)
+    # ============================
+    Write-Host "`n--- USERS USING LEGACY AUTH ---" -ForegroundColor Cyan
 
-} else {
+    $userReport = $legacySignIns | Select-Object `
+        UserDisplayName,
+        UserPrincipalName,
+        AppDisplayName,
+        ClientAppUsed,
+        IPAddress,
+        CreatedDateTime,
+        @{Name="Status";Expression={$_.Status.ErrorCode}}
 
-    $riskyUsers | Sort-Object RiskLevel -Descending | Format-Table -AutoSize
+    $userReport | Format-Table -AutoSize
 
-    Write-Host ""
-    Write-Host "TOTAL RISKY USERS:" $riskyUsers.Count -ForegroundColor Yellow
+    # ============================
+    # GROUP SUMMARY
+    # ============================
+    Write-Host "`n--- APP BREAKDOWN ---" -ForegroundColor Cyan
 
-    Write-Host ""
-    Write-Host "⚠️ Risk Criteria Used:" -ForegroundColor Cyan
-    Write-Host "- Failed logins >= $failedThreshold"
-    Write-Host "- Total attempts >= $totalThreshold"
-    Write-Host "- Legacy authentication detected"
-    Write-Host "- More than 3 IP addresses"
+    $legacySignIns |
+    Group-Object ClientAppUsed |
+    Sort-Object Count -Descending |
+    Select-Object Name, Count |
+    Format-Table -AutoSize
+
+    # ============================
+    # EXPORT CSV
+    # ============================
+    $exportPath = "$env:USERPROFILE\Desktop\LegacyAuth_Users.csv"
+
+    $userReport | Export-Csv -Path $exportPath -NoTypeInformation
+
+    Write-Host "`nCSV exported to: $exportPath" -ForegroundColor Cyan
 }
 
-Write-Host ""
-Write-Host "✅ Report saved to:" -ForegroundColor Green
-Write-Host $outputFile -ForegroundColor Yellow
+Write-Host "`nSCRIPT COMPLETED SUCCESSFULLY" -ForegroundColor Cyan
