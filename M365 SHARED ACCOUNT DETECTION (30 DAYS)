@@ -1,0 +1,363 @@
+# ============================================
+# M365 SHARED ACCOUNT DETECTION (30 DAYS)
+# SOC-READY FORENSIC SCRIPT
+# ============================================
+
+Write-Host "============================================" -ForegroundColor Cyan
+Write-Host " SHARED ACCOUNT DETECTION SCRIPT" -ForegroundColor Cyan
+Write-Host " Last 30 Days Analysis" -ForegroundColor Cyan
+Write-Host "============================================" -ForegroundColor Cyan
+
+# FIX LOGIN POPUP ISSUE
+Set-MgGraphOption -DisableLoginByWAM $true
+
+# CONNECT TO GRAPH
+Write-Host "`nConnecting to Microsoft Graph..." -ForegroundColor Yellow
+Connect-MgGraph -Scopes "AuditLog.Read.All","Directory.Read.All" -ErrorAction Stop
+
+Write-Host "Connected successfully!" -ForegroundColor Green
+
+# ============================
+# FETCH SIGN-IN LOGS (30 DAYS)
+# ============================
+Write-Host "`nFetching sign-in logs for last 30 days..." -ForegroundColor Yellow
+
+$thirtyDaysAgo = (Get-Date).AddDays(-30)
+$signIns = Get-MgAuditLogSignIn -All -Filter "createdDateTime gt $($thirtyDaysAgo.ToString('yyyy-MM-ddT00:00:00Z'))"
+
+Write-Host "Total sign-ins found: $($signIns.Count)" -ForegroundColor Green
+
+if ($signIns.Count -eq 0) {
+    Write-Host "No sign-ins found in the last 30 days. Exiting." -ForegroundColor Yellow
+    exit
+}
+
+# ============================
+# ANALYZE SIGN-INS
+# ============================
+Write-Host "`nAnalyzing sign-in patterns..." -ForegroundColor Yellow
+
+$accountAnalysis = @{}
+
+foreach ($signIn in $signIns) {
+    $upn = $signIn.UserPrincipalName
+    
+    # Initialize account if not exist
+    if (-not $accountAnalysis.ContainsKey($upn)) {
+        $accountAnalysis[$upn] = @{
+            UPN = $upn
+            SignIns = @()
+            UniqueUsers = @{}
+            UniqueDevices = @{}
+            UniqueApps = @{}
+            UniqueIPs = @{}
+            Browsers = @{}
+            TimeHours = @()
+        }
+    }
+    
+    # Add sign-in record
+    $accountAnalysis[$upn].SignIns += $signIn
+    
+    # Track unique display names (detecting multiple users)
+    $displayName = $signIn.UserDisplayName
+    if ($displayName) {
+        if (-not $accountAnalysis[$upn].UniqueUsers.ContainsKey($displayName)) {
+            $accountAnalysis[$upn].UniqueUsers[$displayName] = 0
+        }
+        $accountAnalysis[$upn].UniqueUsers[$displayName] += 1
+    }
+    
+    # Track unique devices
+    $deviceId = $signIn.DeviceDetail.DeviceId
+    if ($deviceId) {
+        if (-not $accountAnalysis[$upn].UniqueDevices.ContainsKey($deviceId)) {
+            $accountAnalysis[$upn].UniqueDevices[$deviceId] = @{
+                DeviceId = $deviceId
+                DisplayName = $signIn.DeviceDetail.DisplayName
+                OperatingSystem = $signIn.DeviceDetail.OperatingSystem
+                IsCompliant = $signIn.DeviceDetail.IsCompliant
+                TrustType = $signIn.DeviceDetail.TrustType
+            }
+        }
+    }
+    
+    # Track unique apps
+    $app = $signIn.AppDisplayName
+    if ($app) {
+        if (-not $accountAnalysis[$upn].UniqueApps.ContainsKey($app)) {
+            $accountAnalysis[$upn].UniqueApps[$app] = 0
+        }
+        $accountAnalysis[$upn].UniqueApps[$app] += 1
+    }
+    
+    # Track unique IPs
+    $ip = $signIn.IPAddress
+    if ($ip) {
+        if (-not $accountAnalysis[$upn].UniqueIPs.ContainsKey($ip)) {
+            $accountAnalysis[$upn].UniqueIPs[$ip] = @{
+                IP = $ip
+                Count = 0
+                FirstSeen = $signIn.CreatedDateTime
+                LastSeen = $signIn.CreatedDateTime
+                Cities = @()
+                ClientAppUsed = $signIn.ClientAppUsed
+            }
+        }
+        $accountAnalysis[$upn].UniqueIPs[$ip].Count += 1
+        $accountAnalysis[$upn].UniqueIPs[$ip].LastSeen = $signIn.CreatedDateTime
+        if ($signIn.Location.City) {
+            $accountAnalysis[$upn].UniqueIPs[$ip].Cities += $signIn.Location.City
+        }
+    }
+    
+    # Track browser info
+    $userAgent = $signIn.UserAgent
+    $clientAppUsed = $signIn.ClientAppUsed
+    $browserKey = "$clientAppUsed | $userAgent"
+    
+    if (-not $accountAnalysis[$upn].Browsers.ContainsKey($browserKey)) {
+        $accountAnalysis[$upn].Browsers[$browserKey] = @{
+            ClientApp = $clientAppUsed
+            UserAgent = $userAgent
+            Count = 0
+        }
+    }
+    $accountAnalysis[$upn].Browsers[$browserKey].Count += 1
+    
+    # Track time hours
+    $hour = $signIn.CreatedDateTime.Hour
+    $accountAnalysis[$upn].TimeHours += $hour
+}
+
+# ============================
+# CALCULATE RISK SCORES
+# ============================
+Write-Host "`nCalculating risk scores..." -ForegroundColor Yellow
+
+$riskResults = @()
+
+foreach ($upn in $accountAnalysis.Keys) {
+    $data = $accountAnalysis[$upn]
+    
+    $totalSignIns = $data.SignIns.Count
+    $uniqueUsers = $data.UniqueUsers.Count
+    $uniqueDevices = $data.UniqueDevices.Count
+    $uniqueApps = $data.UniqueApps.Count
+    $uniqueIPs = $data.UniqueIPs.Count
+    
+    # Calculate risk score
+    $riskScore = 0
+    
+    # Multiple users using same account = CRITICAL
+    if ($uniqueUsers -gt 1) {
+        $riskScore += 50
+    }
+    
+    # Device inconsistency
+    if ($uniqueDevices -ge 3) {
+        $riskScore += 40
+    } elseif ($uniqueDevices -eq 2) {
+        $riskScore += 20
+    }
+    
+    # App inconsistency
+    if ($uniqueApps -ge 3) {
+        $riskScore += 30
+    } elseif ($uniqueApps -eq 2) {
+        $riskScore += 15
+    }
+    
+    # Time anomalies
+    $timeHours = $data.TimeHours | Sort-Object -Unique
+    if ($timeHours.Count -ge 12) {
+        $riskScore += 20
+    } elseif ($timeHours.Count -ge 8) {
+        $riskScore += 10
+    }
+    
+    # IP variation
+    if ($uniqueIPs -ge 3) {
+        $riskScore += 10
+    }
+    
+    # Risk level classification
+    if ($riskScore -le 30) {
+        $riskLevel = "LOW"
+    } elseif ($riskScore -le 60) {
+        $riskLevel = "MEDIUM"
+    } else {
+        $riskLevel = "HIGH"
+    }
+    
+    $riskResults += [PSCustomObject]@{
+        UserPrincipalName = $upn
+        TotalSignIns = $totalSignIns
+        UniqueUsers = $uniqueUsers
+        UniqueDevices = $uniqueDevices
+        UniqueApps = $uniqueApps
+        UniqueIPs = $uniqueIPs
+        RiskScore = $riskScore
+        RiskLevel = $riskLevel
+    }
+}
+
+# Sort by risk score
+$riskResults = $riskResults | Sort-Object RiskScore -Descending
+
+# ============================
+# DISPLAY SUMMARY TABLE
+# ============================
+Write-Host "`n===============================" -ForegroundColor Green
+Write-Host " RISK SUMMARY (Top 20)" -ForegroundColor Green
+Write-Host "===============================" -ForegroundColor Green
+
+$riskResults | Select-Object -First 20 | Format-Table -AutoSize
+
+# ============================
+# DETAILED FORENSIC DATA
+# ============================
+Write-Host "`n===============================" -ForegroundColor Cyan
+Write-Host " DETAILED FORENSIC ANALYSIS" -ForegroundColor Cyan
+Write-Host "===============================" -ForegroundColor Cyan
+
+$detailedForensic = @()
+
+foreach ($signIn in $signIns) {
+    $upn = $signIn.UserPrincipalName
+    $riskData = $riskResults | Where-Object { $_.UserPrincipalName -eq $upn } | Select-Object -First 1
+    
+    $detailedForensic += [PSCustomObject]@{
+        UserPrincipalName = $upn
+        UserDisplayName = $signIn.UserDisplayName
+        SignInDateTime = $signIn.CreatedDateTime
+        IPAddress = $signIn.IPAddress
+        ClientApp = $signIn.ClientAppUsed
+        AppDisplayName = $signIn.AppDisplayName
+        DeviceName = $signIn.DeviceDetail.DisplayName
+        DeviceOS = $signIn.DeviceDetail.OperatingSystem
+        BrowserUserAgent = $signIn.UserAgent
+        City = $signIn.Location.City
+        Country = $signIn.Location.CountryOrRegion
+        RiskLevel = $riskData.RiskLevel
+        RiskScore = $riskData.RiskScore
+    }
+}
+
+# ============================
+# IP ADDRESS ANALYSIS
+# ============================
+Write-Host "`n===============================" -ForegroundColor Cyan
+Write-Host " IP ADDRESS ANALYSIS" -ForegroundColor Cyan
+Write-Host "===============================" -ForegroundColor Cyan
+
+$ipAnalysis = @()
+
+foreach ($upn in $accountAnalysis.Keys) {
+    $data = $accountAnalysis[$upn]
+    $riskData = $riskResults | Where-Object { $_.UserPrincipalName -eq $upn } | Select-Object -First 1
+    
+    foreach ($ipKey in $data.UniqueIPs.Keys) {
+        $ipInfo = $data.UniqueIPs[$ipKey]
+        
+        $ipAnalysis += [PSCustomObject]@{
+            UserPrincipalName = $upn
+            IPAddress = $ipInfo.IP
+            UsageCount = $ipInfo.Count
+            FirstSeen = $ipInfo.FirstSeen
+            LastSeen = $ipInfo.LastSeen
+            Cities = ($ipInfo.Cities | Select-Object -Unique) -join ", "
+            ClientApp = $ipInfo.ClientAppUsed
+            RiskLevel = $riskData.RiskLevel
+            RiskScore = $riskData.RiskScore
+        }
+    }
+}
+
+$ipAnalysis | Format-Table -AutoSize
+
+# ============================
+# BROWSER & DEVICE ANALYSIS
+# ============================
+Write-Host "`n===============================" -ForegroundColor Cyan
+Write-Host " BROWSER & DEVICE ANALYSIS" -ForegroundColor Cyan
+Write-Host "===============================" -ForegroundColor Cyan
+
+$browserAnalysis = @()
+
+foreach ($signIn in $signIns) {
+    $upn = $signIn.UserPrincipalName
+    $riskData = $riskResults | Where-Object { $_.UserPrincipalName -eq $upn } | Select-Object -First 1
+    
+    $browserAnalysis += [PSCustomObject]@{
+        UserPrincipalName = $upn
+        UserDisplayName = $signIn.UserDisplayName
+        ClientApp = $signIn.ClientAppUsed
+        DeviceName = $signIn.DeviceDetail.DisplayName
+        DeviceOS = $signIn.DeviceDetail.OperatingSystem
+        BrowserAgent = $signIn.UserAgent
+        SignInTime = $signIn.CreatedDateTime
+        IPAddress = $signIn.IPAddress
+        RiskLevel = $riskData.RiskLevel
+    }
+}
+
+$browserAnalysis | Sort-Object UserPrincipalName, SignInTime | Format-Table -AutoSize | Out-Host
+
+# ============================
+# EXPORT TO CSV
+# ============================
+Write-Host "`nExporting reports to Desktop..." -ForegroundColor Yellow
+
+$desktopPath = "$env:USERPROFILE\Desktop\SharedAccount_Reports_30Days"
+
+# Create directory if not exists
+if (-not (Test-Path $desktopPath)) {
+    New-Item -ItemType Directory -Path $desktopPath | Out-Null
+}
+
+# Export 1: Risk Summary
+$riskResults | Export-Csv -Path "$desktopPath\01_SharedAccount_RiskReport.csv" -NoTypeInformation
+Write-Host "✓ Exported: 01_SharedAccount_RiskReport.csv" -ForegroundColor Green
+
+# Export 2: Detailed Forensic
+$detailedForensic | Export-Csv -Path "$desktopPath\02_Detailed_SignIn_Forensics.csv" -NoTypeInformation
+Write-Host "✓ Exported: 02_Detailed_SignIn_Forensics.csv" -ForegroundColor Green
+
+# Export 3: IP Analysis
+$ipAnalysis | Export-Csv -Path "$desktopPath\03_IP_Address_Analysis.csv" -NoTypeInformation
+Write-Host "✓ Exported: 03_IP_Address_Analysis.csv" -ForegroundColor Green
+
+# Export 4: Browser Analysis
+$browserAnalysis | Export-Csv -Path "$desktopPath\04_Browser_Device_Analysis.csv" -NoTypeInformation
+Write-Host "✓ Exported: 04_Browser_Device_Analysis.csv" -ForegroundColor Green
+
+# Export 5: High Risk Only
+$highRiskOnly = $riskResults | Where-Object { $_.RiskLevel -eq "HIGH" }
+if ($highRiskOnly.Count -gt 0) {
+    $highRiskDetailed = @()
+    foreach ($highRisk in $highRiskOnly) {
+        $upn = $highRisk.UserPrincipalName
+        foreach ($signIn in ($detailedForensic | Where-Object { $_.UserPrincipalName -eq $upn })) {
+            $highRiskDetailed += $signIn
+        }
+    }
+    $highRiskDetailed | Export-Csv -Path "$desktopPath\05_HighRisk_Detailed_Forensics.csv" -NoTypeInformation
+    Write-Host "✓ Exported: 05_HighRisk_Detailed_Forensics.csv" -ForegroundColor Green
+}
+
+# ============================
+# SUMMARY
+# ============================
+Write-Host "`n===============================" -ForegroundColor Green
+Write-Host " ANALYSIS SUMMARY" -ForegroundColor Green
+Write-Host "===============================" -ForegroundColor Green
+Write-Host "Total Accounts Analyzed: $($riskResults.Count)" -ForegroundColor Cyan
+Write-Host "Total Sign-ins (30 days): $($signIns.Count)" -ForegroundColor Cyan
+Write-Host "High Risk Accounts: $(($riskResults | Where-Object { $_.RiskLevel -eq 'HIGH' }).Count)" -ForegroundColor Red
+Write-Host "Medium Risk Accounts: $(($riskResults | Where-Object { $_.RiskLevel -eq 'MEDIUM' }).Count)" -ForegroundColor Yellow
+Write-Host "Low Risk Accounts: $(($riskResults | Where-Object { $_.RiskLevel -eq 'LOW' }).Count)" -ForegroundColor Green
+Write-Host "`nReports saved to: $desktopPath" -ForegroundColor Cyan
+
+Write-Host "`n✓ SCRIPT COMPLETED SUCCESSFULLY" -ForegroundColor Green
+Write-Host "===============================" -ForegroundColor Green
