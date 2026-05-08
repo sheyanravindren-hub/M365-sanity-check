@@ -1,148 +1,747 @@
-# ============================================
-# SHAREPOINT + ONEDRIVE SECURITY REPORT
-# External Sharing + Anyone Link Detection
-# CLEAN + ERROR SAFE + CONSOLE + EXCEL
-# ============================================
+<#
+.SYNOPSIS
+    Detects risky sharing activity in Microsoft 365 SharePoint Online and OneDrive
+    
+.DESCRIPTION
+    Identifies files shared via "Anyone with the link" (anonymous/public sharing links)
+    Tracks who created them, when they were shared, and what content was shared
+    
+.PARAMETER DaysToAnalyze
+    Number of days to look back in audit logs (default: 7)
+    
+.PARAMETER OutputPath
+    Path to save CSV and log files (default: Desktop)
+    
+.PARAMETER AuthMethod
+    Authentication method: 'Interactive' (default), 'DeviceCode', or 'ClientSecret'
+    
+.PARAMETER TenantId
+    Tenant ID for authentication (optional, auto-detected if not provided)
+    
+.EXAMPLE
+    .\Detect-RiskySharing-M365-Fixed.ps1
+    
+.EXAMPLE
+    .\Detect-RiskySharing-M365-Fixed.ps1 -DaysToAnalyze 30 -AuthMethod DeviceCode
 
-Import-Module ExchangeOnlineManagement
-Import-Module ImportExcel
+.NOTES
+    Requires: Microsoft.Graph, ExchangeOnlineManagement modules
+    Version: 2.0
+    Date: 2026-05-08
+#>
 
-Connect-ExchangeOnline
+param(
+    [int]$DaysToAnalyze = 7,
+    [string]$OutputPath = [System.IO.Path]::Combine([System.Environment]::GetFolderPath('Desktop')),
+    [ValidateSet('Interactive', 'DeviceCode', 'ClientSecret')]
+    [string]$AuthMethod = 'DeviceCode',
+    [string]$TenantId = $null
+)
 
-# ============================
-# SETTINGS
-# ============================
-$startDate = (Get-Date).AddDays(-30)
-$endDate   = Get-Date
+# ============================================================================
+# CONFIGURATION & INITIALIZATION
+# ============================================================================
 
-Write-Host "`n====================================" -ForegroundColor Cyan
-Write-Host " SHAREPOINT / ONEDRIVE SECURITY REPORT" -ForegroundColor Cyan
-Write-Host "====================================`n" -ForegroundColor Cyan
+$ScriptVersion = "2.0"
+$ScriptStartTime = Get-Date
+$Timestamp = $ScriptStartTime.ToString("yyyyMMdd_HHmmss")
+$LogFile = Join-Path -Path $OutputPath -ChildPath "SharePoint_Audit_$Timestamp.log"
+$ReportFile = Join-Path -Path $OutputPath -ChildPath "SharePoint_Anonymous_Sharing_Report_$Timestamp.csv"
 
-# ============================
-# GET AUDIT LOGS
-# ============================
-$logs = Search-UnifiedAuditLog `
-    -StartDate $startDate `
-    -EndDate $endDate `
-    -Operations SharingSet,SharingInvitationCreated,SecureLinkCreated,AddedToSecureLink,AnonymousLinkCreated,CompanyLinkCreated `
-    -ResultSize 5000 -ErrorAction SilentlyContinue
-
-if (-not $logs) {
-    Write-Host "❌ NO AUDIT DATA FOUND (Check: Audit Logging Enabled)" -ForegroundColor Red
-    return
+# Color codes for console output
+$Colors = @{
+    Success = 'Green'
+    Warning = 'Yellow'
+    Error   = 'Red'
+    Info    = 'Cyan'
+    High    = 'Red'
+    Medium  = 'Yellow'
+    Low     = 'Green'
 }
 
-# ============================
-# PARSE LOGS SAFELY
-# ============================
-$results = foreach ($log in $logs) {
+# Ensure output directory exists
+if (-not (Test-Path -Path $OutputPath)) {
+    New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
+}
 
-    $data = $null
+# ============================================================================
+# LOGGING FUNCTIONS
+# ============================================================================
 
-    if ($log.AuditData) {
-        try {
-            $data = $log.AuditData | ConvertFrom-Json -ErrorAction Stop
+function Write-Log {
+    <#
+    .SYNOPSIS
+        Write to log file and console with timestamp
+    #>
+    param(
+        [string]$Message,
+        [ValidateSet('INFO', 'WARNING', 'ERROR', 'SUCCESS')]
+        [string]$Level = 'INFO'
+    )
+    
+    $Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $LogMessage = "[$Timestamp] [$Level] $Message"
+    
+    # Write to file
+    Add-Content -Path $LogFile -Value $LogMessage
+    
+    # Write to console with color
+    $Color = switch ($Level) {
+        'ERROR'   { $Colors.Error }
+        'WARNING' { $Colors.Warning }
+        'SUCCESS' { $Colors.Success }
+        default   { $Colors.Info }
+    }
+    Write-Host $LogMessage -ForegroundColor $Color
+}
+
+function Show-Header {
+    Write-Host "`n" -NoNewline
+    Write-Host "╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║         M365 Risky Sharing Activity Detection Script           ║" -ForegroundColor Cyan
+    Write-Host "║                       v$ScriptVersion                              ║" -ForegroundColor Cyan
+    Write-Host "╚════════════════════════════════════════════════════════════════╝`n" -ForegroundColor Cyan
+    Write-Log "Script started. Log file: $LogFile" 'INFO'
+}
+
+# ============================================================================
+# MODULE VERIFICATION
+# ============================================================================
+
+function Test-RequiredModules {
+    <#
+    .SYNOPSIS
+        Verify required PowerShell modules are installed
+    #>
+    Write-Log "Checking required PowerShell modules..." 'INFO'
+    
+    $RequiredModules = @(
+        'Microsoft.Graph.Authentication',
+        'Microsoft.Graph.Reports'
+    )
+    
+    $MissingModules = @()
+    
+    foreach ($Module in $RequiredModules) {
+        $ModuleStatus = Get-Module -ListAvailable -Name $Module
+        
+        if ($ModuleStatus) {
+            Write-Log "✓ Module '$Module' found" 'SUCCESS'
         }
-        catch {
-            $data = $null
+        else {
+            Write-Log "✗ Module '$Module' NOT found" 'ERROR'
+            $MissingModules += $Module
         }
     }
-
-    $external = $false
-    if ($data -and $data.TargetUserOrGroupType -match "Guest|External") {
-        $external = $true
+    
+    if ($MissingModules.Count -gt 0) {
+        Write-Log "Installing missing modules..." 'WARNING'
+        foreach ($Module in $MissingModules) {
+            try {
+                Install-Module -Name $Module -Scope CurrentUser -Force -AllowClobber
+                Write-Log "✓ Installed '$Module'" 'SUCCESS'
+            }
+            catch {
+                Write-Log "✗ Failed to install '$Module': $_" 'ERROR'
+                return $false
+            }
+        }
     }
-
-    $anyoneLink = $false
-    if ($log.Operations -match "AnonymousLinkCreated|CompanyLinkCreated") {
-        $anyoneLink = $true
-    }
-
-    [PSCustomObject]@{
-        User         = $log.UserIds
-        Time         = $log.CreationDate
-        IPAddress    = $log.ClientIP
-        Action       = $log.Operations
-        FileOrFolder = if ($data) { $data.ObjectId } else { "N/A" }
-        Site         = if ($data) { $data.SiteUrl } else { "N/A" }
-        External     = $external
-        AnyoneLink   = $anyoneLink
-    }
-}
-
-# ============================
-# FILTER DATA
-# ============================
-$externalShares = $results | Where-Object { $_.External -eq $true }
-$anyoneLinks    = $results | Where-Object { $_.AnyoneLink -eq $true }
-
-# ============================
-# CONSOLE OUTPUT
-# ============================
-
-Write-Host "========== ALL SHARING EVENTS ==========`n" -ForegroundColor Cyan
-$results | Sort-Object Time -Descending | Format-Table -AutoSize
-
-Write-Host "`nTOTAL EVENTS: $($results.Count)" -ForegroundColor Yellow
-
-# ---- External Sharing ----
-Write-Host "`n========== EXTERNAL SHARING ==========`n" -ForegroundColor Cyan
-
-if ($externalShares.Count -gt 0) {
-    $externalShares | Sort-Object Time -Descending |
-        Format-Table User, Action, FileOrFolder, Time, IPAddress -AutoSize
-} else {
-    Write-Host "No external sharing detected" -ForegroundColor Green
-}
-
-Write-Host "TOTAL EXTERNAL SHARES: $($externalShares.Count)" -ForegroundColor Yellow
-
-# ---- Anyone Links ----
-Write-Host "`n========== ANYONE WITH LINK ==========`n" -ForegroundColor Cyan
-
-if ($anyoneLinks.Count -gt 0) {
-    $anyoneLinks | Sort-Object Time -Descending |
-        Format-Table User, Action, FileOrFolder, Time, IPAddress -AutoSize
-} else {
-    Write-Host "No anyone-with-link sharing detected" -ForegroundColor Green
-}
-
-Write-Host "TOTAL ANYONE LINKS: $($anyoneLinks.Count)" -ForegroundColor Yellow
-
-# ---- Top Users ----
-Write-Host "`n========== TOP SHARING USERS ==========`n" -ForegroundColor Cyan
-
-$results |
-Group-Object User |
-Sort-Object Count -Descending |
-Select-Object Name, Count |
-Format-Table -AutoSize
-
-# ============================
-# EXCEL EXPORT (FIXED)
-# ============================
-$outputFile = "$env:USERPROFILE\Downloads\SP_OD_Security_Report.xlsx"
-
-if (Test-Path $outputFile) {
+    
+    # Import modules
     try {
-        Remove-Item $outputFile -Force -ErrorAction Stop
+        Import-Module -Name 'Microsoft.Graph.Authentication' -DisableNameChecking -ErrorAction Stop
+        Import-Module -Name 'Microsoft.Graph.Reports' -DisableNameChecking -ErrorAction Stop
+        
+        # Try to import Exchange module for audit logs
+        if (Get-Module -ListAvailable -Name 'ExchangeOnlineManagement') {
+            Import-Module -Name 'ExchangeOnlineManagement' -DisableNameChecking -ErrorAction SilentlyContinue
+            Write-Log "✓ Exchange Online module loaded" 'SUCCESS'
+        }
+        
+        Write-Log "✓ All required modules imported successfully" 'SUCCESS'
+        return $true
     }
     catch {
-        Write-Host "⚠ Close Excel file first then rerun" -ForegroundColor Yellow
+        Write-Log "✗ Failed to import modules: $_" 'ERROR'
+        return $false
     }
 }
 
-# Sheet 1 - All
-$results | Export-Excel -Path $outputFile -WorksheetName "AllSharing" -AutoSize -BoldTopRow
+# ============================================================================
+# AUTHENTICATION
+# ============================================================================
 
-# Sheet 2 - External
-$externalShares | Export-Excel -Path $outputFile -WorksheetName "ExternalSharing" -AutoSize -Append
+function Connect-ToMicrosoftGraph {
+    <#
+    .SYNOPSIS
+        Connect to Microsoft Graph with specified authentication method
+    #>
+    param(
+        [string]$AuthMethod,
+        [string]$TenantId
+    )
+    
+    Write-Log "Initiating Microsoft Graph authentication using $AuthMethod method..." 'INFO'
+    
+    try {
+        # Define required scopes
+        $Scopes = @(
+            'AuditLog.Read.All',
+            'Sites.Read.All',
+            'Files.Read.All',
+            'User.Read.All'
+        )
+        
+        $ConnectParams = @{
+            Scopes   = $Scopes
+            ErrorAction = 'Stop'
+        }
+        
+        # Add tenant ID if provided
+        if ($TenantId) {
+            $ConnectParams['TenantId'] = $TenantId
+        }
+        
+        switch ($AuthMethod) {
+            'Interactive' {
+                Write-Log "Using Interactive authentication (browser popup expected)" 'INFO'
+                
+                # Add NoWAM to avoid parent window handle issues
+                Connect-MgGraph @ConnectParams -NoWAM
+            }
+            
+            'DeviceCode' {
+                Write-Log "Using Device Code authentication - check your browser" 'INFO'
+                Write-Host "`n[ACTION REQUIRED] A device code will appear below:" -ForegroundColor Yellow
+                Write-Host "1. Copy the device code shown below" -ForegroundColor Yellow
+                Write-Host "2. Visit: https://microsoft.com/devicelogin" -ForegroundColor Yellow
+                Write-Host "3. Paste the code and complete authentication`n" -ForegroundColor Yellow
+                
+                Connect-MgGraph @ConnectParams -DeviceCode
+            }
+            
+            'ClientSecret' {
+                Write-Log "Using Client Secret authentication" 'INFO'
+                Write-Host "`n[ACTION REQUIRED] Enter your credentials:" -ForegroundColor Yellow
+                
+                $ClientId = Read-Host "Enter Application (Client) ID"
+                $ClientSecret = Read-Host "Enter Client Secret" -AsSecureString
+                $TenantIdRequired = Read-Host "Enter Tenant ID"
+                
+                $ClientSecretCredential = New-Object System.Management.Automation.PSCredential(
+                    $ClientId,
+                    $ClientSecret
+                )
+                
+                Connect-MgGraph @ConnectParams `
+                    -TenantId $TenantIdRequired `
+                    -ClientSecretCredential $ClientSecretCredential
+            }
+        }
+        
+        # Verify connection
+        $Context = Get-MgContext
+        if ($Context) {
+            Write-Log "✓ Successfully connected to Microsoft Graph" 'SUCCESS'
+            Write-Log "  Tenant: $($Context.TenantId)" 'INFO'
+            Write-Log "  Account: $($Context.Account)" 'INFO'
+            return $true
+        }
+        else {
+            Write-Log "✗ Failed to verify Graph connection" 'ERROR'
+            return $false
+        }
+    }
+    catch {
+        Write-Log "✗ Authentication failed: $_" 'ERROR'
+        
+        # Provide troubleshooting guidance
+        Write-Host "`n[TROUBLESHOOTING]" -ForegroundColor Yellow
+        Write-Host "If you see WAM errors:" -ForegroundColor Yellow
+        Write-Host "  • Try: .\Detect-RiskySharing-M365-Fixed.ps1 -AuthMethod DeviceCode" -ForegroundColor Yellow
+        Write-Host "  • Or:  .\Detect-RiskySharing-M365-Fixed.ps1 -AuthMethod ClientSecret" -ForegroundColor Yellow
+        
+        return $false
+    }
+}
 
-# Sheet 3 - Anyone Links
-$anyoneLinks | Export-Excel -Path $outputFile -WorksheetName "AnyoneLinks" -AutoSize -Append
+# ============================================================================
+# AUDIT LOG RETRIEVAL
+# ============================================================================
 
-Write-Host "`n====================================" -ForegroundColor Cyan
-Write-Host "✅ REPORT GENERATED SUCCESSFULLY" -ForegroundColor Green
-Write-Host "FILE: $outputFile" -ForegroundColor Yellow
-Write-Host "====================================`n" -ForegroundColor Cyan
+function Get-UnifiedAuditLogData {
+    <#
+    .SYNOPSIS
+        Retrieve sharing-related events from Unified Audit Logs
+    #>
+    param(
+        [int]$DaysBack
+    )
+    
+    Write-Log "Retrieving Unified Audit Logs (last $DaysBack days)..." 'INFO'
+    
+    $StartDate = (Get-Date).AddDays(-$DaysBack)
+    $EndDate = Get-Date
+    
+    # Sharing operation types to search for
+    $Operations = @(
+        'FileSharingSet',
+        'SharingSet',
+        'AddedToSecureLink',
+        'AnonymousLinkCreated',
+        'SecureLinkCreated'
+    )
+    
+    $AllAuditEvents = @()
+    
+    try {
+        # Check if Exchange Online is connected
+        $ExoConnection = Get-ConnectionInformation -ErrorAction SilentlyContinue
+        
+        if (-not $ExoConnection) {
+            Write-Log "Attempting to connect to Exchange Online for audit logs..." 'WARNING'
+            try {
+                Connect-ExchangeOnline -ShowProgress $false -ErrorAction Stop
+                Write-Log "✓ Connected to Exchange Online" 'SUCCESS'
+            }
+            catch {
+                Write-Log "⚠ Could not connect to Exchange Online. Will use limited audit data." 'WARNING'
+                return $null
+            }
+        }
+        
+        foreach ($Operation in $Operations) {
+            Write-Log "  Searching for operation: $Operation" 'INFO'
+            
+            $AuditParams = @{
+                StartDate   = $StartDate
+                EndDate     = $EndDate
+                Operations  = $Operation
+                ResultSize  = 5000
+                ErrorAction = 'SilentlyContinue'
+            }
+            
+            $Events = Search-UnifiedAuditLog @AuditParams
+            
+            if ($Events) {
+                Write-Log "    Found $($Events.Count) events" 'SUCCESS'
+                $AllAuditEvents += $Events
+            }
+        }
+        
+        return $AllAuditEvents
+    }
+    catch {
+        Write-Log "⚠ Error retrieving audit logs: $_" 'WARNING'
+        return $null
+    }
+}
+
+# ============================================================================
+# PARSE AND EXTRACT SHARING DATA
+# ============================================================================
+
+function Parse-SharingAuditEvents {
+    <#
+    .SYNOPSIS
+        Parse audit log events to extract sharing details
+    #>
+    param(
+        [array]$AuditEvents
+    )
+    
+    if (-not $AuditEvents) {
+        Write-Log "No audit events to parse" 'WARNING'
+        return @()
+    }
+    
+    Write-Log "Parsing $($AuditEvents.Count) audit events..." 'INFO'
+    
+    $SharingActivities = @()
+    
+    foreach ($Event in $AuditEvents) {
+        try {
+            # Parse the AuditData JSON
+            $AuditData = $Event.AuditData | ConvertFrom-Json -ErrorAction SilentlyContinue
+            
+            if (-not $AuditData) {
+                continue
+            }
+            
+            # Extract key information
+            $Activity = @{
+                UserPrincipalName = $Event.UserIds
+                FileName          = $AuditData.SourceFileName
+                FileUrl           = $AuditData.SourceFileUrl
+                SiteUrl           = $AuditData.SiteUrl
+                Operation         = $Event.Operations
+                CreatedDateTime   = $Event.CreationDate
+                IPAddress         = $Event.ClientIP
+                SharingType       = 'Unknown'
+                RiskLevel         = 'Low'
+                EventId           = $Event.ObjectId
+            }
+            
+            # Determine sharing type from audit data
+            if ($AuditData.SharingType) {
+                $Activity.SharingType = $AuditData.SharingType
+            }
+            
+            # Check for anonymous/public sharing indicators
+            if ($AuditData.SharingType -match 'AnonymousLink|PublicLink|Everyone' -or
+                $Event.Operations -match 'AnonymousLinkCreated' -or
+                $AuditData.ShareLinkSharingPermission -match 'Anonymous|Public') {
+                
+                $Activity.SharingType = 'Anyone with the link'
+                $Activity.RiskLevel = 'High'
+            }
+            elseif ($AuditData.SharingType -match 'External') {
+                $Activity.SharingType = 'External'
+                $Activity.RiskLevel = 'Medium'
+            }
+            elseif ($AuditData.SharingType -match 'Internal|Organization') {
+                $Activity.SharingType = 'Organization'
+                $Activity.RiskLevel = 'Low'
+            }
+            
+            # Add additional context from AuditData
+            if ($AuditData.TargetUserOrGroupName) {
+                $Activity.SharedWith = $AuditData.TargetUserOrGroupName
+            }
+            
+            $SharingActivities += $Activity
+        }
+        catch {
+            Write-Log "⚠ Error parsing event: $_" 'WARNING'
+            continue
+        }
+    }
+    
+    Write-Log "✓ Parsed $($SharingActivities.Count) sharing activities" 'SUCCESS'
+    return $SharingActivities
+}
+
+# ============================================================================
+# QUERY SHAREPOINT FOR ANONYMOUS LINKS
+# ============================================================================
+
+function Get-AnonymousLinksFromSharePoint {
+    <#
+    .SYNOPSIS
+        Query SharePoint sites for files with anonymous sharing links
+    #>
+    
+    Write-Log "Querying SharePoint sites for anonymous sharing links..." 'INFO'
+    
+    $AnonymousLinks = @()
+    
+    try {
+        # Get all SharePoint sites
+        $Sites = Get-MgSite -All -ErrorAction SilentlyContinue
+        
+        if (-not $Sites) {
+            Write-Log "⚠ Could not retrieve SharePoint sites" 'WARNING'
+            return @()
+        }
+        
+        Write-Log "Found $($Sites.Count) SharePoint sites" 'INFO'
+        
+        foreach ($Site in $Sites) {
+            Write-Log "  Scanning site: $($Site.DisplayName)" 'INFO'
+            
+            try {
+                # Get drives in site (lists and libraries)
+                $Drives = Get-MgSiteDrive -SiteId $Site.Id -ErrorAction SilentlyContinue
+                
+                foreach ($Drive in $Drives) {
+                    # Get items in drive
+                    $Items = Get-MgDriveItem -DriveId $Drive.Id -ErrorAction SilentlyContinue
+                    
+                    foreach ($Item in $Items) {
+                        # Check for shared links
+                        $Permissions = Get-MgDriveItemPermission -DriveId $Drive.Id -DriveItemId $Item.Id `
+                            -ErrorAction SilentlyContinue
+                        
+                        foreach ($Permission in $Permissions) {
+                            # Check if link is anonymous/public
+                            if ($Permission.Link.Scope -match 'anonymous|public') {
+                                $AnonymousLinks += @{
+                                    UserPrincipalName = $Permission.GrantedToV2.User.UserPrincipalName
+                                    FileName         = $Item.Name
+                                    FileUrl          = $Item.WebUrl
+                                    SiteUrl          = $Site.WebUrl
+                                    SharingType      = 'Anyone with the link'
+                                    CreatedDateTime  = $Permission.Link.CreatedDateTime
+                                    RiskLevel        = 'High'
+                                    PermissionId     = $Permission.Id
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-Log "    ⚠ Error scanning site: $_" 'WARNING'
+                continue
+            }
+        }
+        
+        if ($AnonymousLinks.Count -gt 0) {
+            Write-Log "✓ Found $($AnonymousLinks.Count) anonymous sharing links" 'SUCCESS'
+        }
+        else {
+            Write-Log "✓ No anonymous sharing links found in SharePoint" 'SUCCESS'
+        }
+        
+        return $AnonymousLinks
+    }
+    catch {
+        Write-Log "⚠ Error querying SharePoint: $_" 'WARNING'
+        return @()
+    }
+}
+
+# ============================================================================
+# REPORTING AND ANALYSIS
+# ============================================================================
+
+function Build-RiskReport {
+    <#
+    .SYNOPSIS
+        Consolidate all sharing data and create risk report
+    #>
+    param(
+        [array]$AuditActivities,
+        [array]$AnonymousLinks
+    )
+    
+    Write-Log "Building risk report..." 'INFO'
+    
+    $AllActivities = @()
+    
+    # Add audit log activities
+    if ($AuditActivities) {
+        $AllActivities += $AuditActivities
+    }
+    
+    # Add SharePoint anonymous links
+    if ($AnonymousLinks) {
+        $AllActivities += $AnonymousLinks
+    }
+    
+    # Remove duplicates
+    $UniqueActivities = $AllActivities | Group-Object -Property FileUrl | ForEach-Object {
+        $_.Group[0]
+    }
+    
+    Write-Log "✓ Report contains $($UniqueActivities.Count) unique sharing activities" 'SUCCESS'
+    return $UniqueActivities
+}
+
+function Show-RiskSummary {
+    <#
+    .SYNOPSIS
+        Display summary statistics of risky sharing
+    #>
+    param(
+        [array]$RiskReport
+    )
+    
+    Write-Host "`n" -NoNewline
+    Write-Host "╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║                      RISK SUMMARY REPORT                       ║" -ForegroundColor Cyan
+    Write-Host "╚════════════════════════════════════════════════════════════════╝`n" -ForegroundColor Cyan
+    
+    if ($RiskReport.Count -eq 0) {
+        Write-Host "No risky sharing activities detected." -ForegroundColor Green
+        return
+    }
+    
+    # Risk distribution
+    $HighRisk   = @($RiskReport | Where-Object { $_.RiskLevel -eq 'High' }).Count
+    $MediumRisk = @($RiskReport | Where-Object { $_.RiskLevel -eq 'Medium' }).Count
+    $LowRisk    = @($RiskReport | Where-Object { $_.RiskLevel -eq 'Low' }).Count
+    
+    Write-Host "Total Sharing Activities:        $($RiskReport.Count)" -ForegroundColor White
+    Write-Host "  " -NoNewline
+    Write-Host "🔴 HIGH RISK (Anyone with link):    $HighRisk" -ForegroundColor Red
+    Write-Host "  " -NoNewline
+    Write-Host "🟡 MEDIUM RISK (External):          $MediumRisk" -ForegroundColor Yellow
+    Write-Host "  " -NoNewline
+    Write-Host "🟢 LOW RISK (Internal only):        $LowRisk" -ForegroundColor Green
+    
+    # Top users creating shares
+    Write-Host "`nTop Users Creating Shares:" -ForegroundColor Cyan
+    $TopUsers = $RiskReport | Group-Object -Property UserPrincipalName | 
+        Sort-Object -Property Count -Descending | Select-Object -First 5
+    
+    foreach ($User in $TopUsers) {
+        $HighCount = @($User.Group | Where-Object { $_.RiskLevel -eq 'High' }).Count
+        $Indicator = if ($HighCount -gt 0) { "🔴" } else { "  " }
+        Write-Host "  $Indicator $($User.Name): $($User.Count) shares" -ForegroundColor White
+    }
+    
+    # Most shared sites
+    Write-Host "`nMost Shared Sites:" -ForegroundColor Cyan
+    $TopSites = $RiskReport | Group-Object -Property SiteUrl | 
+        Sort-Object -Property Count -Descending | Select-Object -First 5
+    
+    foreach ($Site in $TopSites) {
+        Write-Host "  • $($Site.Name): $($Site.Count) shares" -ForegroundColor White
+    }
+    
+    Write-Host "`n"
+}
+
+function Export-ReportToCSV {
+    <#
+    .SYNOPSIS
+        Export risk report to CSV file
+    #>
+    param(
+        [array]$RiskReport,
+        [string]$FilePath
+    )
+    
+    Write-Log "Exporting report to CSV: $FilePath" 'INFO'
+    
+    try {
+        if ($RiskReport.Count -eq 0) {
+            Write-Log "No data to export" 'WARNING'
+            return
+        }
+        
+        # Create export-friendly object
+        $ExportData = $RiskReport | Select-Object -Property @(
+            'UserPrincipalName',
+            'FileName',
+            'FileUrl',
+            'SiteUrl',
+            'SharingType',
+            'RiskLevel',
+            'CreatedDateTime',
+            'IPAddress'
+        )
+        
+        $ExportData | Export-Csv -Path $FilePath -NoTypeInformation -Encoding UTF8
+        Write-Log "✓ Report exported to CSV: $FilePath" 'SUCCESS'
+    }
+    catch {
+        Write-Log "✗ Failed to export CSV: $_" 'ERROR'
+    }
+}
+
+function Show-DetailedTable {
+    <#
+    .SYNOPSIS
+        Display detailed sharing data in formatted table
+    #>
+    param(
+        [array]$RiskReport
+    )
+    
+    if ($RiskReport.Count -eq 0) {
+        Write-Log "No sharing activities to display" 'INFO'
+        return
+    }
+    
+    Write-Host "`n" -NoNewline
+    Write-Host "╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║                   DETAILED SHARING ACTIVITY                    ║" -ForegroundColor Cyan
+    Write-Host "╚════════════════════════════════════════════════════════════════╝`n" -ForegroundColor Cyan
+    
+    # Show high-risk items first
+    $HighRiskItems = $RiskReport | Where-Object { $_.RiskLevel -eq 'High' } | 
+        Select-Object -First 10
+    
+    if ($HighRiskItems.Count -gt 0) {
+        Write-Host "🔴 HIGH RISK ITEMS (Anyone with the link):" -ForegroundColor Red
+        Write-Host ""
+        
+        foreach ($Item in $HighRiskItems) {
+            Write-Host "  User:       $($Item.UserPrincipalName)" -ForegroundColor White
+            Write-Host "  File:       $($Item.FileName)" -ForegroundColor Yellow
+            Write-Host "  File URL:   $($Item.FileUrl)" -ForegroundColor White
+            Write-Host "  Site:       $($Item.SiteUrl)" -ForegroundColor White
+            Write-Host "  Type:       $($Item.SharingType)" -ForegroundColor Red
+            Write-Host "  Date:       $($Item.CreatedDateTime)" -ForegroundColor White
+            if ($Item.IPAddress) {
+                Write-Host "  IP:         $($Item.IPAddress)" -ForegroundColor White
+            }
+            Write-Host ""
+        }
+    }
+    
+    # Show medium-risk items
+    $MediumRiskItems = $RiskReport | Where-Object { $_.RiskLevel -eq 'Medium' } | 
+        Select-Object -First 5
+    
+    if ($MediumRiskItems.Count -gt 0) {
+        Write-Host "🟡 MEDIUM RISK ITEMS (External sharing):" -ForegroundColor Yellow
+        Write-Host ""
+        
+        foreach ($Item in $MediumRiskItems) {
+            Write-Host "  User:       $($Item.UserPrincipalName)" -ForegroundColor White
+            Write-Host "  File:       $($Item.FileName)" -ForegroundColor White
+            Write-Host "  Type:       $($Item.SharingType)" -ForegroundColor Yellow
+            Write-Host "  Date:       $($Item.CreatedDateTime)" -ForegroundColor White
+            Write-Host ""
+        }
+    }
+}
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+function Main {
+    Show-Header
+    
+    # Verify modules
+    if (-not (Test-RequiredModules)) {
+        Write-Log "Failed module verification. Exiting." 'ERROR'
+        exit 1
+    }
+    
+    # Authenticate
+    if (-not (Connect-ToMicrosoftGraph -AuthMethod $AuthMethod -TenantId $TenantId)) {
+        Write-Log "Failed authentication. Exiting." 'ERROR'
+        exit 1
+    }
+    
+    # Collect data
+    $AuditEvents = Get-UnifiedAuditLogData -DaysBack $DaysToAnalyze
+    $AuditActivities = Parse-SharingAuditEvents -AuditEvents $AuditEvents
+    $AnonymousLinks = Get-AnonymousLinksFromSharePoint
+    
+    # Build report
+    $RiskReport = Build-RiskReport -AuditActivities $AuditActivities -AnonymousLinks $AnonymousLinks
+    
+    # Display results
+    Show-RiskSummary -RiskReport $RiskReport
+    Show-DetailedTable -RiskReport $RiskReport
+    
+    # Export to CSV
+    Export-ReportToCSV -RiskReport $RiskReport -FilePath $ReportFile
+    
+    # Final summary
+    Write-Host "`n" -NoNewline
+    Write-Host "╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║                     EXECUTION COMPLETED                        ║" -ForegroundColor Cyan
+    Write-Host "╚════════════════════════════════════════════════════════════════╝`n" -ForegroundColor Cyan
+    
+    Write-Log "Script execution completed successfully" 'SUCCESS'
+    Write-Host "Report saved to: $ReportFile" -ForegroundColor Green
+    Write-Host "Logs saved to:   $LogFile" -ForegroundColor Green
+    Write-Host "`n"
+    
+    # Disconnect
+    Disconnect-MgGraph -Confirm:$false -ErrorAction SilentlyContinue
+}
+
+# ============================================================================
+# SCRIPT EXECUTION
+# ============================================================================
+
+Main
